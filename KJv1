@@ -1,0 +1,409 @@
+set.seed(123)
+
+# =========================
+# PARAMETERS
+# =========================
+lambda1 <- 18
+lambda2 <- 22
+C <- 32
+T_days <- 365
+
+# behavior parameters
+alpha <- 0.05
+gamma <- 0.2
+delta <- 0.1
+
+# retry behavior
+retry_prob_balk <- 0.4
+retry_prob_full <- 0.7
+
+# calendar horizon
+calendar_buffer <- 30
+calendar_length <- T_days + calendar_buffer
+
+# =========================
+# STATE
+# =========================
+calendar <- vector("list", calendar_length)
+
+results_list <- list()
+res_idx <- 1
+
+cancel_count <- numeric(calendar_length)
+slot_booked  <- numeric(calendar_length)
+slot_used    <- numeric(calendar_length)
+
+# NEW tracking
+balk_count <- numeric(calendar_length)
+balk_full_count <- numeric(calendar_length)
+retry_queue <- numeric(calendar_length)
+
+# =========================
+# HELPER
+# =========================
+find_next_slot <- function(calendar, C, current_day, max_day) {
+  for (day in current_day:max_day) {
+    if (is.null(calendar[[day]]) || length(calendar[[day]]) < C) {
+      return(day)
+    }
+  }
+  return(NA)
+}
+
+# =========================
+# SIMULATION LOOP
+# =========================
+for (day in 1:T_days) {
+  
+  # -------------------------
+  # 1. ARRIVALS (WITH RETRY)
+  # -------------------------
+  base_arrivals <- rpois(1, lambda1) + rpois(1, lambda2)
+  retry_arrivals <- retry_queue[day]
+  
+  n_arrivals <- base_arrivals + retry_arrivals
+  
+  for (i in 1:n_arrivals) {
+    
+    max_day <- min(day + calendar_buffer - 1, calendar_length)
+    slot_day <- find_next_slot(calendar, C, day, max_day)
+    
+    # forced balk (full)
+    if (is.na(slot_day)) {
+      results_list[[res_idx]] <- data.frame(wait = NA, outcome = "balk_full")
+      balk_full_count[day] <- balk_full_count[day] + 1
+      res_idx <- res_idx + 1
+      next
+    }
+    
+    wait_time <- slot_day - day
+    
+    p_accept <- exp(-alpha * wait_time)
+    
+    if (runif(1) < p_accept) {
+      calendar[[slot_day]] <- c(calendar[[slot_day]], wait_time)
+      slot_booked[slot_day] <- slot_booked[slot_day] + 1
+    } else {
+      results_list[[res_idx]] <- data.frame(wait = wait_time, outcome = "balk")
+      balk_count[day] <- balk_count[day] + 1
+      res_idx <- res_idx + 1
+    }
+  }
+  
+  # -------------------------
+  # RETRY GENERATION
+  # -------------------------
+  retry_from_balk <- rbinom(1, balk_count[day], retry_prob_balk)
+  retry_from_full <- rbinom(1, balk_full_count[day], retry_prob_full)
+  
+  if (day + 1 <= calendar_length) {
+    retry_queue[day + 1] <- retry_queue[day + 1] + retry_from_balk + retry_from_full
+  }
+  
+  # -------------------------
+  # 2. CANCELLATIONS
+  # -------------------------
+  for (d in (day+1):calendar_length) {
+    
+    if (!is.null(calendar[[d]]) && length(calendar[[d]]) > 0) {
+      
+      current_waits <- calendar[[d]]
+      
+      remaining_time <- d - day
+      p_cancel_vec <- 1 - exp(-gamma * remaining_time)
+      
+      cancel_draw <- runif(length(current_waits))
+      
+      cancelled_idx <- which(cancel_draw <= p_cancel_vec)
+      kept_idx <- which(cancel_draw > p_cancel_vec)
+      
+      if (length(cancelled_idx) > 0) {
+        cancel_count[d] <- cancel_count[d] + length(cancelled_idx)
+        
+        for (w in current_waits[cancelled_idx]) {
+          results_list[[res_idx]] <- data.frame(wait = w, outcome = "cancelled")
+          res_idx <- res_idx + 1
+        }
+      }
+      
+      calendar[[d]] <- current_waits[kept_idx]
+    }
+  }
+  
+  # -------------------------
+  # 3. PROCESS TODAY
+  # -------------------------
+  if (!is.null(calendar[[day]]) && length(calendar[[day]]) > 0) {
+    
+    slot_used[day] <- length(calendar[[day]])
+    
+    for (wait_time in calendar[[day]]) {
+      
+      p_show <- exp(-delta * wait_time)
+      
+      if (runif(1) < p_show) {
+        results_list[[res_idx]] <- data.frame(wait = wait_time, outcome = "served")
+      } else {
+        results_list[[res_idx]] <- data.frame(wait = wait_time, outcome = "no_show")
+      }
+      
+      res_idx <- res_idx + 1
+    }
+    
+    calendar[[day]] <- numeric(0)
+  }
+}
+
+# =========================
+# RESULTS
+# =========================
+results <- do.call(rbind, results_list)
+
+# =========================
+# METRICS
+# =========================
+cat("\n===== OUTCOMES =====\n")
+print(table(results$outcome))
+print(prop.table(table(results$outcome)))
+
+cat("\n===== WAIT TIMES =====\n")
+print(summary(results$wait))
+print(aggregate(wait ~ outcome, data = results, mean))
+
+# =========================
+# UTILIZATION
+# =========================
+served <- sum(results$outcome == "served")
+capacity <- T_days * C
+
+true_utilization <- sum(slot_used) / capacity
+service_rate <- served / capacity
+
+cat("\n===== UTILIZATION =====\n")
+cat("True utilization:", true_utilization, "\n")
+cat("Service rate:", service_rate, "\n")
+
+# =========================
+# FLOW + BALK BREAKDOWN
+# =========================
+cat("\n===== FLOW =====\n")
+cat("Bookings:", sum(slot_booked), "\n")
+cat("Cancellations:", sum(cancel_count), "\n")
+
+cat("\n===== BALK BREAKDOWN =====\n")
+cat("Balk (wait-based):", sum(balk_count), "\n")
+cat("Balk (full):", sum(balk_full_count), "\n")
+
+# =========================
+# PLOTS
+# =========================
+par(mfrow = c(2,2))
+
+hist(results$wait, main="Wait Time Distribution", xlab="Days")
+
+plot(balk_count, type="l", main="Balk (Wait-Based)")
+plot(balk_full_count, type="l", main="Balk (Full Capacity)")
+
+plot(retry_queue, type="l", main="Retry Demand")
+
+
+
+run_sim <- function(
+    daily_demand = 40,
+    demand_split = 0.5,
+    daily_capacity = 32,
+    booking_horizon = 30,
+    patience = 20,
+    cancel_sensitivity = 0.2,
+    no_show_sensitivity = 0.1,
+    T_days = 365
+) {
+  
+  lambda1 <- daily_demand * demand_split
+  lambda2 <- daily_demand * (1 - demand_split)
+  
+  alpha <- 1 / patience
+  gamma <- cancel_sensitivity
+  delta <- no_show_sensitivity
+  
+  calendar_length <- T_days + booking_horizon
+  calendar <- vector("list", calendar_length)
+  
+  slot_used <- numeric(calendar_length)
+  
+  # NEW tracking
+  results <- character()
+  wait_times <- numeric()
+  
+  cancel_count <- numeric(calendar_length)
+  balk_count <- numeric(calendar_length)
+  balk_full_count <- numeric(calendar_length)
+  
+  find_next_slot <- function(calendar, C, current_day, max_day) {
+    for (day in current_day:max_day) {
+      if (is.null(calendar[[day]]) || length(calendar[[day]]) < C) {
+        return(day)
+      }
+    }
+    return(NA)
+  }
+  
+  for (day in 1:T_days) {
+    
+    n_arrivals <- rpois(1, lambda1) + rpois(1, lambda2)
+    
+    for (i in 1:n_arrivals) {
+      
+      max_day <- min(day + booking_horizon - 1, calendar_length)
+      slot_day <- find_next_slot(calendar, daily_capacity, day, max_day)
+      
+      # forced balk
+      if (is.na(slot_day)) {
+        results <- c(results, "balk_full")
+        balk_full_count[day] <- balk_full_count[day] + 1
+        next
+      }
+      
+      wait_time <- slot_day - day
+      
+      if (runif(1) < exp(-alpha * wait_time)) {
+        calendar[[slot_day]] <- c(calendar[[slot_day]], wait_time)
+      } else {
+        results <- c(results, "balk")
+        wait_times <- c(wait_times, wait_time)
+        balk_count[day] <- balk_count[day] + 1
+      }
+    }
+    
+    # cancellations
+    for (d in (day+1):calendar_length) {
+      if (!is.null(calendar[[d]]) && length(calendar[[d]]) > 0) {
+        
+        current_waits <- calendar[[d]]
+        remaining_time <- d - day
+        
+        p_cancel <- 1 - exp(-gamma * remaining_time)
+        keep <- runif(length(current_waits)) > p_cancel
+        
+        cancelled <- current_waits[!keep]
+        
+        if (length(cancelled) > 0) {
+          results <- c(results, rep("cancelled", length(cancelled)))
+          wait_times <- c(wait_times, cancelled)
+          cancel_count[d] <- cancel_count[d] + length(cancelled)
+        }
+        
+        calendar[[d]] <- current_waits[keep]
+      }
+    }
+    
+    # process day
+    if (!is.null(calendar[[day]]) && length(calendar[[day]]) > 0) {
+      
+      slot_used[day] <- length(calendar[[day]])
+      
+      for (wait_time in calendar[[day]]) {
+        if (runif(1) < exp(-delta * wait_time)) {
+          results <- c(results, "served")
+        } else {
+          results <- c(results, "no_show")
+        }
+        wait_times <- c(wait_times, wait_time)
+      }
+      
+      calendar[[day]] <- numeric(0)
+    }
+  }
+  
+  outcomes <- prop.table(table(results))
+  
+  list(
+    utilization = sum(slot_used) / (T_days * daily_capacity),
+    service_rate = sum(results == "served") / (T_days * daily_capacity),
+    outcomes = outcomes,
+    
+    wait_summary = summary(wait_times),
+    mean_wait = mean(wait_times, na.rm = TRUE),
+    
+    cancellations = sum(cancel_count),
+    balk_wait = sum(balk_count),
+    balk_full = sum(balk_full_count),
+    
+    # for plots
+    wait_times = wait_times,
+    balk_series = balk_count,
+    balk_full_series = balk_full_count
+  )
+}
+
+library(shiny)
+
+ui <- fluidPage(
+  titlePanel("Appointment System Simulator"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("demand", "Daily Demand", 10, 100, 40),
+      sliderInput("capacity", "Daily Capacity", 10, 60, 32),
+      sliderInput("horizon", "Booking Horizon", 5, 60, 30),
+      sliderInput("patience", "Patient Patience", 5, 50, 20),
+      sliderInput("cancel", "Cancellation Sensitivity", 0.01, 0.5, 0.2),
+      sliderInput("noshow", "No-show Sensitivity", 0.01, 0.5, 0.1)
+    ),
+    
+    mainPanel(
+      h3("Metrics"),
+      verbatimTextOutput("metrics"),
+      
+      h3("Plots"),
+      plotOutput("plots")
+    )
+  )
+)
+
+server <- function(input, output) {
+  
+  sim <- reactive({
+    run_sim(
+      daily_demand = input$demand,
+      daily_capacity = input$capacity,
+      booking_horizon = input$horizon,
+      patience = input$patience,
+      cancel_sensitivity = input$cancel,
+      no_show_sensitivity = input$noshow
+    )
+  })
+  
+  output$metrics <- renderPrint({
+    res <- sim()
+    
+    cat("===== UTILIZATION =====\n")
+    cat("Utilization:", res$utilization, "\n")
+    cat("Service rate:", res$service_rate, "\n\n")
+    
+    cat("===== OUTCOMES =====\n")
+    print(res$outcomes)
+    
+    cat("\n===== WAIT =====\n")
+    print(res$wait_summary)
+    cat("Mean wait:", res$mean_wait, "\n\n")
+    
+    cat("===== FLOW =====\n")
+    cat("Cancellations:", res$cancellations, "\n")
+    cat("Balk (wait):", res$balk_wait, "\n")
+    cat("Balk (full):", res$balk_full, "\n")
+  })
+  
+  output$plots <- renderPlot({
+    res <- sim()
+    
+    par(mfrow = c(2,2))
+    
+    hist(res$wait_times, main="Wait Time", xlab="Days")
+    
+    plot(res$balk_series, type="l", main="Balk (Wait)")
+    plot(res$balk_full_series, type="l", main="Balk (Full)")
+  })
+}
+
+shinyApp(ui, server)
